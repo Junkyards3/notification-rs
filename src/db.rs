@@ -6,10 +6,10 @@ const DB_URL: &str = "sqlite://sqlite.db";
 
 #[derive(sqlx::FromRow, Debug)]
 pub struct Notification {
-    id: u32,
+    pub(crate) id: u32,
     pub(crate) title: String,
     pub(crate) body: String,
-    date: NaiveDateTime,
+    pub(crate) date: NaiveDateTime,
 }
 
 pub struct SqliteDb {
@@ -32,12 +32,12 @@ impl SqliteDb {
             pool: SqlitePool::connect(DB_URL).await?,
         };
 
-        db.create_table().await?;
+        db.create_table(false).await?;
 
         Ok(db)
     }
 
-    async fn create_table(&self) -> Result<(), sqlx::Error> {
+    async fn create_table(&self, should_put_values: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS notifications (
@@ -50,14 +50,16 @@ impl SqliteDb {
         )
         .execute(&self.pool)
         .await?;
-        sqlx::query(
-            r#"
-            INSERT INTO notifications (title, body, date)
-            VALUES ('title', 'body', '2023-07-15 13:00:00')
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        if should_put_values {
+            sqlx::query(
+                r#"
+                INSERT INTO notifications (title, body, date)
+                VALUES ('Courses', 'Penser à acheter coca', '2023-07-16 13:00:00')
+                "#,
+            )
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -72,5 +74,19 @@ impl SqliteDb {
         .fetch_all(&self.pool)
         .await?;
         Ok(notifications)
+    }
+
+    pub async fn delete_notification(&self, id: u32) -> Result<bool, sqlx::Error> {
+        let query_result = sqlx::query(
+            r#"
+                DELETE FROM notifications
+                WHERE id = $1
+                "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(query_result.rows_affected() > 0)
     }
 }
