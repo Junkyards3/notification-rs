@@ -2,9 +2,8 @@ use std::io;
 use std::io::Stdout;
 use std::time::{Duration, Instant};
 
-use crate::app::App;
-use crate::db::Notification;
-use crossterm::event::{Event, KeyCode};
+use chrono::Local;
+use crossterm::event::Event;
 use crossterm::{
     event,
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -12,17 +11,13 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use tui::backend::CrosstermBackend;
-use tui::style::{Color, Modifier, Style};
-use tui::text::{Span, Spans};
-use tui::widgets::{List, ListItem, ListState};
-use tui::{
-    backend::Backend,
-    layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders},
-    Frame, Terminal,
-};
+use tui::Terminal;
 
-pub async fn run() -> Result<(), io::Error> {
+use crate::app::App;
+use crate::db::{NotificationContent, SqliteDb};
+use crate::ui::ui;
+
+pub async fn run() -> Result<(), sqlx::Error> {
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -31,8 +26,10 @@ pub async fn run() -> Result<(), io::Error> {
     let mut terminal = Terminal::new(backend)?;
 
     // app
-    let app = App::new().await;
-    run_app(&mut terminal, app).await?;
+    let db = SqliteDb::set_up_db().await?;
+    let notifications = db.load_notifications().await?;
+    let app = App::new(notifications);
+    let res = run_app(&mut terminal, app, db);
 
     // restore terminal
     disable_raw_mode()?;
@@ -43,34 +40,47 @@ pub async fn run() -> Result<(), io::Error> {
     )?;
     terminal.show_cursor()?;
 
+    if let Err(err) = res {
+        println!("Error: {}", err)
+    }
+
     Ok(())
 }
 
-async fn run_app(
+fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     mut app: App,
+    db: SqliteDb,
 ) -> io::Result<()> {
-    let last_tick = Instant::now();
+    let mut last_tick = Instant::now();
+    let tick_rate = Duration::from_millis(250);
+
+    let mut database_tick = Instant::now();
+    let database_tick_rate = Duration::from_secs(10);
+    let mut last_update = Local::now();
+
     loop {
-        terminal.draw(|f| ui(f, &app.notifications, &mut app.state))?;
+        app.clean_sent_notifications();
+        let notifications = app.get_notifications_content();
 
-        let timeout = Duration::from_millis(250)
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_secs(0));
+        terminal.draw(|f| {
+            ui(
+                f,
+                &notifications,
+                &mut app.state,
+                last_update,
+                app.input_mode,
+                app.input_field,
+                &app.input_values,
+            )
+        })?;
 
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char(c) => {
-                            app.on_key(c).await;
-                        }
-                        KeyCode::Up => app.on_up(),
-                        KeyCode::Down => app.on_down(),
-                        _ => {}
-                    }
-                }
-            }
+        last_tick = app_input(&mut app, last_tick, tick_rate)?;
+
+        if database_tick.elapsed() >= database_tick_rate {
+            database_tick = Instant::now();
+            last_update = Local::now();
+            sync_database(&db, notifications);
         }
 
         if app.should_quit {
@@ -78,43 +88,33 @@ async fn run_app(
         }
     }
 }
-fn ui<B: Backend>(
-    f: &mut Frame<B>,
-    notifications: &[Notification],
-    notifications_state: &mut ListState,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)].as_ref())
-        .split(f.size());
 
-    let block = Block::default().title("Keys").borders(Borders::ALL);
-    f.render_widget(block, chunks[0]);
+fn app_input(app: &mut App, last_tick: Instant, tick_rate: Duration) -> crossterm::Result<Instant> {
+    let timeout = Duration::from_millis(250)
+        .checked_sub(last_tick.elapsed())
+        .unwrap_or_else(|| Duration::from_secs(0));
 
-    let list_items = notifications
-        .iter()
-        .map(|n| {
-            ListItem::new(Spans::from(vec![
-                Span::styled(&n.title, Style::default().fg(Color::Red)),
-                Span::raw(" "),
-                Span::raw(&n.body),
-                Span::raw(" "),
-                Span::styled(
-                    n.date.format("%d %B - %R").to_string(),
-                    Style::default().fg(Color::Blue),
-                ),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let list_items = List::new(list_items)
-        .block(
-            Block::default()
-                .title("Notifications")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list_items, chunks[1], notifications_state);
+    if event::poll(timeout)? {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == event::KeyEventKind::Press {
+                app.on_key(key.code);
+            }
+        }
+    }
+
+    if last_tick.elapsed() >= tick_rate {
+        Ok(Instant::now())
+    } else {
+        Ok(last_tick)
+    }
+}
+
+fn sync_database(db: &SqliteDb, notifications: Vec<NotificationContent>) {
+    tokio_scoped::scope(|scope| {
+        scope.spawn(async {
+            db.synchronize_notifications(notifications)
+                .await
+                .expect("Error synchronizing notifications");
+        });
+    });
 }

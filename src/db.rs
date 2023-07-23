@@ -1,12 +1,11 @@
 use sqlx::migrate::MigrateDatabase;
 use sqlx::types::chrono::NaiveDateTime;
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 const DB_URL: &str = "sqlite://sqlite.db";
 
-#[derive(sqlx::FromRow, Debug)]
-pub struct Notification {
-    pub(crate) id: u32,
+#[derive(sqlx::FromRow, Clone)]
+pub struct NotificationContent {
     pub(crate) title: String,
     pub(crate) body: String,
     pub(crate) date: NaiveDateTime,
@@ -19,13 +18,10 @@ pub struct SqliteDb {
 impl SqliteDb {
     pub async fn set_up_db() -> Result<SqliteDb, sqlx::Error> {
         if !Sqlite::database_exists(DB_URL).await.unwrap_or(false) {
-            println!("Creating database {}", DB_URL);
-            match Sqlite::create_database(DB_URL).await {
-                Ok(_) => println!("Create db success"),
-                Err(error) => panic!("error: {}", error),
+            if let Err(error) = Sqlite::create_database(DB_URL).await {
+                panic!("error: {}", error)
             }
         } else {
-            println!("Database already exists");
         }
 
         let db = SqliteDb {
@@ -63,10 +59,10 @@ impl SqliteDb {
         Ok(())
     }
 
-    pub async fn load_notifications(&self) -> Result<Vec<Notification>, sqlx::Error> {
+    pub async fn load_notifications(&self) -> Result<Vec<NotificationContent>, sqlx::Error> {
         let notifications = sqlx::query_as(
             r#"
-            SELECT id, title, body, date
+            SELECT title, body, date
             FROM notifications
             ORDER BY date
             "#,
@@ -76,17 +72,30 @@ impl SqliteDb {
         Ok(notifications)
     }
 
-    pub async fn delete_notification(&self, id: u32) -> Result<bool, sqlx::Error> {
-        let query_result = sqlx::query(
+    pub async fn synchronize_notifications(
+        &self,
+        notifications: Vec<NotificationContent>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
             r#"
                 DELETE FROM notifications
-                WHERE id = $1
                 "#,
         )
-        .bind(id)
         .execute(&self.pool)
         .await?;
 
-        Ok(query_result.rows_affected() > 0)
+        if !notifications.is_empty() {
+            QueryBuilder::new("INSERT INTO notifications (title, body, date) ")
+                .push_values(notifications, |mut b, notification| {
+                    b.push_bind(notification.title)
+                        .push_bind(notification.body)
+                        .push_bind(notification.date);
+                })
+                .build()
+                .execute(&self.pool)
+                .await?;
+        }
+
+        Ok(())
     }
 }
